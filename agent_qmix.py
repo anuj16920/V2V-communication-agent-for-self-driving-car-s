@@ -237,22 +237,26 @@ class QMIXAgent:
         return self.epsilon_end + (self.epsilon_start - self.epsilon_end) * (1.0 - frac) ** 2
     
     @torch.no_grad()
-    def act(self, states: np.ndarray) -> np.ndarray:
-        """Decentralized execution: each agent picks action based on local obs"""
-        epsilon = self._get_epsilon()
+    def act(self, states: np.ndarray, explore: bool = True) -> np.ndarray:
+        """Decentralized execution: each agent picks action based on local obs.
+
+        explore=True  → epsilon-greedy (training rollouts)
+        explore=False → pure greedy argmax (evaluation — no random noise)
+        """
+        epsilon = self._get_epsilon() if explore else 0.0
         actions = np.zeros(self.n_agents, dtype=np.int64)
-        
+
         # Get Q-values for all agents
         s = torch.FloatTensor(states).unsqueeze(0).to(self.device)  # (1, N, S)
         self.q_network.eval()
         q_all = self.q_network(s).squeeze(0)  # (N, A)
-        
+
         for i in range(self.n_agents):
-            if np.random.rand() < epsilon:
+            if epsilon > 0.0 and np.random.rand() < epsilon:
                 actions[i] = np.random.randint(0, self.n_actions)
             else:
                 actions[i] = q_all[i].argmax().item()
-        
+
         return actions
     
     def store(

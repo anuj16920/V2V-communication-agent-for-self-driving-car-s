@@ -631,6 +631,7 @@ class V2VManhattanEnv(gym.Env):
                     5.0 * pdrs[i]
                     + 2.0 * throughputs[i]
                     - 3.0 * collisions[i]
+                    + 1.5 * solo_bonuses[i]   # KEEP channel-diversity incentive past stage 1
                     + 1.5 * fairness
                     + 1.0 * reliability[i]
                     + 1.0 * int_bonus[i]   # intersection safety bonus from stage 2
@@ -643,6 +644,7 @@ class V2VManhattanEnv(gym.Env):
                     + 2.0 * fairness
                     + 3.0 * reliability[i]
                     - 3.0 * collisions[i]
+                    + 1.0 * solo_bonuses[i]   # KEEP channel-diversity incentive in full objective
                     - 2.5 * latency_viols[i]
                     - 0.5 * energy_used[i]
                     + 1.5 * int_bonus[i]   # safety-critical intersection delivery

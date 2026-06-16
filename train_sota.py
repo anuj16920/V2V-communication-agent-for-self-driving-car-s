@@ -56,9 +56,12 @@ os.makedirs("models_sota",       exist_ok=True)
 # advance organically into Stage 2/3 rather than always hitting MAX_STAGE_EPS.
 # Random-walk threshold was 0.15 (easier open-space coordination).
 _COLL_THRESH = 0.28 if USE_MANHATTAN else 0.15
+# Stage 2 PDR threshold lowered 0.40 → 0.25 for Manhattan: NLoS building loss caps
+# achievable PDR far below open-space; 0.40 was never met organically (plateaued ~0.21).
+_PDR_THRESH = 0.25 if USE_MANHATTAN else 0.40
 STAGE_ADVANCE = {
     1: dict(metric="collision", op="lt", threshold=_COLL_THRESH),
-    2: dict(metric="pdr",       op="gt", threshold=0.40),
+    2: dict(metric="pdr",       op="gt", threshold=_PDR_THRESH),
 }
 ROLLING_WINDOW  = 100   # episodes to average over
 MIN_STAGE_EPS   = 600   # never advance before this many episodes in current stage
@@ -254,7 +257,7 @@ def train_qmix_sota(
         if ep > 0 and ep % EVAL_INTERVAL == 0 and stage == 3:
             env_eval = (V2VManhattanEnv if USE_MANHATTAN else V2VEnv)(
                 n_v2v=n_v2v, n_subchannels=4, episode_len=50, curriculum_stage=3)
-            qmix_res = evaluate_policy(env_eval, lambda e, s: agent.act(s), episodes=20)
+            qmix_res = evaluate_policy(env_eval, lambda e, s: agent.act(s, explore=False), episodes=20)
             cur_pdr  = qmix_res["PDR"]
             if cur_pdr > best_pdr:
                 best_pdr  = cur_pdr
@@ -272,10 +275,15 @@ def train_qmix_sota(
                 print(f"    >> Best model (PDR={best_pdr:.3f}) saved → {path}")
 
     # ── Final evaluation ─────────────────────────────────────────
+    # Load best checkpoint so a late-training dip doesn't define reported results
+    if best_ckpt is not None:
+        agent.q_network.load_state_dict(best_ckpt["q_network"])
+        agent.mixer.load_state_dict(best_ckpt["mixer"])
+        print(f"  Loaded best QMIX checkpoint (PDR={best_pdr:.3f}, ep={best_ckpt['ep']}) for final eval")
     print("\n  Running final evaluation …")
     env_eval = (V2VManhattanEnv if USE_MANHATTAN else V2VEnv)(
         n_v2v=n_v2v, n_subchannels=4, episode_len=50, curriculum_stage=3)
-    qmix_policy  = lambda e, s: agent.act(s)
+    qmix_policy  = lambda e, s: agent.act(s, explore=False)
     rand_res     = evaluate_policy(env_eval, random_policy,     episodes=50)
     greedy_res   = evaluate_policy(env_eval, greedy_csi_policy, episodes=50)
     rr_res       = evaluate_policy(env_eval, round_robin_policy, episodes=50)
@@ -344,7 +352,7 @@ def train_mappo_sota(
         gae_lambda     = 0.97,
         clip_eps       = 0.1,     # tight clipping for stable updates
         entropy_coef   = 0.02,
-        entropy_min    = 0.001,
+        entropy_min    = 0.005,   # was 0.001 — too low caused policy collapse in late Stage 3
         epochs         = 4,
         minibatch      = 32,
         grad_clip      = 0.5,
@@ -427,7 +435,14 @@ def train_mappo_sota(
                 }, path)
                 print(f"  >> Best MAPPO (PDR={best_pdr:.3f}) saved → {path}")
 
-    # Final evaluation
+    # Final evaluation — load best checkpoint so late-stage entropy collapse doesn't hurt results
+    tag  = "manhattan" if USE_MANHATTAN else "rw"
+    best_path = f"models_sota/mappo_best_{tag}_n{n_v2v}.pth"
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=agent.device)
+        agent.actor.load_state_dict(ckpt["actor"])
+        agent.critic.load_state_dict(ckpt["critic"])
+        print(f"  Loaded best checkpoint (PDR={best_pdr:.3f}) for final evaluation")
     env_eval = (V2VManhattanEnv if USE_MANHATTAN else V2VEnv)(
         n_v2v=n_v2v, n_subchannels=4, episode_len=50, curriculum_stage=3)
     mappo_res = evaluate_policy(env_eval, lambda e, s: agent.act(s), episodes=50)
@@ -520,7 +535,7 @@ def print_comparison(results: dict, n_v2v: int):
 def main():
     DENSITIES      = [8, 16, 24]
     EPISODES       = 5000      # 3000 was too short — both agents stuck in Stage 1/2
-    TRAIN_ALL      = False     # Set True to train all 3 densities
+    TRAIN_ALL      = True      # n=8 done; now train n=16 and n=24 with transfer learning
 
     scenario = "Manhattan Grid" if USE_MANHATTAN else "Random Walk"
     print("\n" + "=" * 72)
