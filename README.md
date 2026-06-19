@@ -1,4 +1,4 @@
-# V2V Multi-Agent Reinforcement Learning
+# V2V Multi-Agent Reinforcement Learning.
 
 Advanced Vehicle-to-Vehicle (V2V) resource allocation using Transformer-based DQN and MAPPO agents.
 
