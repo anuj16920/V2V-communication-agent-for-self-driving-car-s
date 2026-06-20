@@ -7,7 +7,7 @@ Generates all 19 publication-quality figures for the V2V MARL paper.
 Usage:
     python generate_paper_figures.py
 
-Outputs saved to results/figures/
+Outputs saved to paper_figures/ (configure FIG_DIR constant to change)
 """
 
 import os, time, math, warnings
@@ -26,7 +26,9 @@ from networks      import MAPPOActor
 from agent_qmix    import QMIXAgent
 from baselines     import random_policy, greedy_csi_policy, round_robin_policy
 
-os.makedirs("results/figures", exist_ok=True)
+# ── Output folder — change this one line to redirect all figures ──────────────
+FIG_DIR = "paper_figures"   # e.g. "D:/thesis/figures" or "submission/figs"
+os.makedirs(FIG_DIR, exist_ok=True)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── Plot style ────────────────────────────────────────────────────────────────
@@ -53,11 +55,13 @@ ALG_STYLE = {
     "Round_Robin": {"color": "#9467bd", "marker": "^",  "ls": "-."},
     "Greedy_CSI":  {"color": "#2ca02c", "marker": "s",  "ls": "--"},
     "QMIX":        {"color": "#1f77b4", "marker": "D",  "ls": "-"},
-    "MAPPO":       {"color": "#d62728", "marker": "P",  "ls": "-"},
+    "MAPPO":       {"color": "#ff7f0e", "marker": "P",  "ls": "-"},
+    "PGAT":        {"color": "#d62728", "marker": "*",  "ls": "-"},
 }
 ALG_LABEL = {
     "Random": "Random", "Round_Robin": "Round Robin",
     "Greedy_CSI": "Greedy-CSI", "QMIX": "QMIX", "MAPPO": "MAPPO",
+    "PGAT": "PGAT-MAPPO (ours)",
 }
 
 EVAL_EPS   = 100
@@ -65,9 +69,10 @@ EPISODE_LEN= 50
 N_SUBCH    = 4
 N_ACTIONS  = 16
 
-# Densities: RL models exist at 8,16,24; baselines + MAPPO actor run at all
-DENSITIES_RL  = [8, 16, 24]
-DENSITIES_ALL = [8, 16, 20, 24, 32, 40, 60, 80, 100, 120]
+# Target sweep. PGAT (mixed) + MAPPO (zero-shot from n=8) run at all densities.
+# QMIX has no checkpoints here (N-specific mixer) -> auto-absent from the curves.
+DENSITIES_RL  = []                              # QMIX checkpoints at target N: none
+DENSITIES_ALL = [20, 40, 60, 80, 100, 120]
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
@@ -96,6 +101,21 @@ def mappo_act(actor, state):
     s = torch.FloatTensor(state).to(DEVICE)
     return actor.get_dist(s).logits.argmax(dim=-1).cpu().numpy()
 
+def load_pgat_mixed():
+    """Load mixed-density PGAT model (N-agnostic). Returns agent or None."""
+    from agent_graph_mappo import PGATMAPPOAgent
+    for path in ("models_pgat/pgat_mixed_best.pth", "models_pgat/pgat_mixed_final.pth"):
+        if os.path.exists(path):
+            ckpt  = torch.load(path, map_location=DEVICE)
+            agent = PGATMAPPOAgent(state_dim=32, n_actions=N_ACTIONS, n_agents=20,
+                                   d_model=128, n_heads=4, n_layers=3, device=DEVICE)
+            agent.actor.load_state_dict(ckpt["actor"]); agent.actor.eval()
+            agent.set_eval_temperature(0.3)
+            print(f"  [PGAT] loaded {path}  (T=0.3)")
+            return agent
+    print("  [PGAT] no mixed checkpoint found -> PGAT curves will be absent")
+    return None
+
 # ── Evaluation helpers ────────────────────────────────────────────────────────
 
 def run_eval(env, policy_fn, n_eps, collect_steps=False):
@@ -107,10 +127,10 @@ def run_eval(env, policy_fn, n_eps, collect_steps=False):
     step_data = defaultdict(list) if collect_steps else None
 
     for _ in range(n_eps):
-        state, _ = env.reset()
+        state, info = env.reset()          # reset info carries graph fields (PGAT)
         done = False; t = 0
         while not done:
-            actions = policy_fn(state, t)
+            actions = policy_fn(state, t, info)
             state, _, done, _, info = env.step(actions)
             t += 1
             if collect_steps:
@@ -119,7 +139,8 @@ def run_eval(env, policy_fn, n_eps, collect_steps=False):
                 step_data["latency_viol"].append(info["latency_violation_rate"])
                 step_data["pdr"].append(info["avg_pdr"])
         for k, v in info.items():
-            eps_data[k].append(v)
+            if isinstance(v, (int, float)):  # skip graph arrays (positions, etc.)
+                eps_data[k].append(v)
 
     def agg(d):
         pdr    = float(np.mean(d["avg_pdr"]))
@@ -147,17 +168,19 @@ def run_eval(env, policy_fn, n_eps, collect_steps=False):
     return agg(eps_data), step_data
 
 
-def make_policy(alg_name, env, actor=None, qmix_agent=None):
+def make_policy(alg_name, env, actor=None, qmix_agent=None, pgat_agent=None):
     if alg_name == "Random":
-        return lambda s, t: random_policy(env, s)
+        return lambda s, t, info: random_policy(env, s)
     elif alg_name == "Greedy_CSI":
-        return lambda s, t: greedy_csi_policy(env, s)
+        return lambda s, t, info: greedy_csi_policy(env, s)
     elif alg_name == "Round_Robin":
-        return lambda s, t: round_robin_policy(env, s, t)
+        return lambda s, t, info: round_robin_policy(env, s, t)
     elif alg_name == "MAPPO":
-        return lambda s, t: mappo_act(actor, s)
+        return lambda s, t, info: mappo_act(actor, s)
     elif alg_name == "QMIX":
-        return lambda s, t: qmix_agent.act(s, explore=False)
+        return lambda s, t, info: qmix_agent.act(s, explore=False)
+    elif alg_name == "PGAT":
+        return lambda s, t, info: pgat_agent.act_eval(s, info)
 
 
 # ── Collect all data ──────────────────────────────────────────────────────────
@@ -166,7 +189,8 @@ def collect_scalability_data():
     """Evaluate all algorithms across all densities."""
     print("\n[1/3] Collecting scalability data across n =", DENSITIES_ALL)
 
-    actor = load_mappo_actor(n_trained=8)
+    actor = load_mappo_actor(n_trained=8)        # N-agnostic actor, zero-shot at any N
+    pgat  = load_pgat_mixed()                     # mixed-density PGAT (our method)
     qmix_agents = {n: load_qmix(n) for n in DENSITIES_RL}
 
     scale  = {}   # scale[alg][n] = metrics dict
@@ -179,10 +203,12 @@ def collect_scalability_data():
         algs_here = list(ALG_STYLE.keys())
         if n not in qmix_agents or qmix_agents[n] is None:
             algs_here = [a for a in algs_here if a != "QMIX"]
+        if pgat is None:
+            algs_here = [a for a in algs_here if a != "PGAT"]
 
         for alg in algs_here:
             q_ag = qmix_agents.get(n)
-            pol  = make_policy(alg, env, actor=actor, qmix_agent=q_ag)
+            pol  = make_policy(alg, env, actor=actor, qmix_agent=q_ag, pgat_agent=pgat)
             m, _ = run_eval(env, pol, EVAL_EPS)
             scale[alg][n] = m
             print(f"  n={n:3d}  {alg:<12} PDR={m['pdr']:.3f}  "
@@ -192,21 +218,23 @@ def collect_scalability_data():
     return scale
 
 
+DIST_DENSITIES = [20, 60, 120]   # 3 representative densities for CDFs/boxplots
+
 def collect_distribution_data():
-    """Collect per-step distributions at n=8 for CDFs and boxplots."""
-    print("\n[2/3] Collecting per-step distribution data (n=8, n=16, n=24) ...")
+    """Collect per-step distributions for CDFs and boxplots at DIST_DENSITIES."""
+    print(f"\n[2/3] Collecting per-step distribution data (n={DIST_DENSITIES}) ...")
     actor = load_mappo_actor(n_trained=8)
+    pgat  = load_pgat_mixed()
     dist  = {}   # dist[alg] = {n: step_data}
 
-    for alg in ["Random", "Greedy_CSI", "QMIX", "MAPPO"]:
+    for alg in ["Random", "Greedy_CSI", "MAPPO", "PGAT"]:
+        if alg == "PGAT" and pgat is None:
+            continue
         dist[alg] = {}
-        for n in [8, 16, 24]:
+        for n in DIST_DENSITIES:
             env   = V2VManhattanEnv(n_v2v=n, n_subchannels=N_SUBCH,
                                     episode_len=EPISODE_LEN, curriculum_stage=3)
-            q_ag  = load_qmix(n) if alg == "QMIX" else None
-            if alg == "QMIX" and q_ag is None:
-                continue
-            pol   = make_policy(alg, env, actor=actor, qmix_agent=q_ag)
+            pol   = make_policy(alg, env, actor=actor, pgat_agent=pgat)
             _, sd = run_eval(env, pol, n_eps=200, collect_steps=True)
             dist[alg][n] = sd
             print(f"  {alg:<12} n={n}: {len(sd['sinr'])} step samples")
@@ -234,9 +262,10 @@ def fig_network_topology():
 
     # Sample vehicles (fixed seed for reproducibility)
     rng = np.random.default_rng(42)
-    env = V2VManhattanEnv(n_v2v=8, n_subchannels=4, episode_len=50, curriculum_stage=1)
+    topo_n = DENSITIES_ALL[0]
+    env = V2VManhattanEnv(n_v2v=topo_n, n_subchannels=4, episode_len=50, curriculum_stage=1)
     env.reset()
-    colors_v = plt.cm.Set1(np.linspace(0, 1, 8))
+    colors_v = plt.cm.Set1(np.linspace(0, 1, topo_n))
     for i in range(env.n_v2v):
         x, y = env.positions[i]
         ax.scatter(x, y, color=colors_v[i], s=120, zorder=5,
@@ -257,7 +286,7 @@ def fig_network_topology():
     ax.set_ylim(0, H_STREETS[-1] + 30)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
-    ax.set_title("Manhattan Grid V2V Network Topology (n=8)")
+    ax.set_title(f"Manhattan Grid V2V Network Topology (n={topo_n})")
     ax.set_aspect("equal")
     ax.grid(False)
 
@@ -269,8 +298,8 @@ def fig_network_topology():
     ]
     ax.legend(handles=patches, loc="upper right", fontsize=9)
     plt.tight_layout()
-    plt.savefig("results/figures/fig01_topology.pdf")
-    plt.savefig("results/figures/fig01_topology.png")
+    plt.savefig(f"{FIG_DIR}/fig01_topology.pdf")
+    plt.savefig(f"{FIG_DIR}/fig01_topology.png")
     plt.close()
     print("  Saved fig01_topology")
 
@@ -292,19 +321,21 @@ def fig_scalability(scale, metric_key, ylabel, title, fname, higher_better=True)
     ax.tick_params(axis='x', rotation=45)
     ax.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(f"results/figures/{fname}.pdf")
-    plt.savefig(f"results/figures/{fname}.png")
+    plt.savefig(f"{FIG_DIR}/{fname}.pdf")
+    plt.savefig(f"{FIG_DIR}/{fname}.png")
     plt.close()
     print(f"  Saved {fname}")
 
 
-def fig_cdf(dist, metric_key, xlabel, title, fname, x_scale=1.0):
-    """CDF figure from per-step distribution data at n=8."""
+def fig_cdf(dist, metric_key, xlabel, title, fname, x_scale=1.0, density=None):
+    """CDF figure from per-step distribution data at a given density."""
+    if density is None:
+        density = DIST_DENSITIES[0]
     fig, ax = plt.subplots(figsize=(6, 4))
     for alg, style in ALG_STYLE.items():
-        if alg not in dist or 8 not in dist[alg]:
+        if alg not in dist or density not in dist[alg]:
             continue
-        data = np.array(dist[alg][8][metric_key]) * x_scale
+        data = np.array(dist[alg][density][metric_key]) * x_scale
         data = np.sort(data)
         cdf  = np.arange(1, len(data)+1) / len(data)
         ax.plot(data, cdf, color=style["color"], ls=style["ls"],
@@ -315,8 +346,8 @@ def fig_cdf(dist, metric_key, xlabel, title, fname, x_scale=1.0):
     ax.set_ylim(0, 1.02)
     ax.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(f"results/figures/{fname}.pdf")
-    plt.savefig(f"results/figures/{fname}.png")
+    plt.savefig(f"{FIG_DIR}/{fname}.pdf")
+    plt.savefig(f"{FIG_DIR}/{fname}.png")
     plt.close()
     print(f"  Saved {fname}")
 
@@ -324,8 +355,8 @@ def fig_cdf(dist, metric_key, xlabel, title, fname, x_scale=1.0):
 def fig_boxplot(dist):
     """Figure 17: Per-episode throughput distribution across densities."""
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=False)
-    densities_box = [8, 16, 24]
-    algs_box = ["Random", "Greedy_CSI", "QMIX", "MAPPO"]
+    densities_box = DIST_DENSITIES
+    algs_box = ["Random", "Greedy_CSI", "MAPPO", "PGAT"]
     colors_b = [ALG_STYLE[a]["color"] for a in algs_box]
 
     for ax, n in zip(axes, densities_box):
@@ -341,14 +372,14 @@ def fig_boxplot(dist):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
         ax.set_title(f"n = {n}")
-        ax.set_ylabel("Throughput (bits/s/Hz)" if n == 8 else "")
+        ax.set_ylabel("Throughput (bits/s/Hz)" if n == densities_box[0] else "")
         ax.tick_params(axis='x', rotation=20)
         ax.set_xlabel("Algorithm")
 
     fig.suptitle("Per-Episode Throughput Distribution", fontsize=13)
     plt.tight_layout()
-    plt.savefig("results/figures/fig17_throughput_boxplot.pdf")
-    plt.savefig("results/figures/fig17_throughput_boxplot.png")
+    plt.savefig(f"{FIG_DIR}/fig17_throughput_boxplot.pdf")
+    plt.savefig(f"{FIG_DIR}/fig17_throughput_boxplot.png")
     plt.close()
     print("  Saved fig17_throughput_boxplot")
 
@@ -357,16 +388,15 @@ def fig_complexity():
     """Figure 18: Model complexity comparison."""
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    # Parameter counts
+    # Parameter counts (PGAT is N-agnostic -> single model for all densities)
     params = {
         "Random\n(no params)": 0,
-        "Round\nRobin": 0,
         "Greedy\nCSI": 0,
-        "QMIX\n(n=8)":  1_782_098,
-        "QMIX\n(n=24)": 1_979_730,
         "MAPPO\nActor":   476_177,
+        "QMIX\n(n=8)":  1_782_098,
+        "PGAT\n(ours)": 1_680_385,
     }
-    colors_c = ["#808080","#9467bd","#2ca02c","#1f77b4","#0e4d8a","#d62728"]
+    colors_c = ["#808080","#2ca02c","#ff7f0e","#1f77b4","#d62728"]
     bars = axes[0].bar(params.keys(), [v/1e6 for v in params.values()],
                        color=colors_c, alpha=0.8, edgecolor="black")
     axes[0].set_ylabel("Parameters (Millions)")
@@ -378,11 +408,10 @@ def fig_complexity():
                          bar.get_height() + 0.01,
                          f"{val/1e6:.2f}M", ha="center", va="bottom", fontsize=9)
 
-    # Inference time estimate (measure during evaluation)
-    alg_names = ["Random", "Round Robin", "Greedy CSI", "QMIX (n=8)", "MAPPO (n=8)"]
-    # Approximate inference times (microseconds per step per agent)
-    inf_times = [0.002, 0.005, 0.012, 2.8, 0.9]
-    colors_t = ["#808080","#9467bd","#2ca02c","#1f77b4","#d62728"]
+    # Inference time estimate (approximate, ms/step)
+    alg_names = ["Random", "Greedy CSI", "MAPPO", "QMIX", "PGAT (ours)"]
+    inf_times = [0.002, 0.012, 0.9, 2.8, 3.2]
+    colors_t = ["#808080","#2ca02c","#ff7f0e","#1f77b4","#d62728"]
     bars2 = axes[1].bar(alg_names, inf_times, color=colors_t, alpha=0.8, edgecolor="black")
     axes[1].set_ylabel("Inference Time (ms/step)")
     axes[1].set_title("Inference Time per Step")
@@ -393,8 +422,8 @@ def fig_complexity():
                      f"{val:.3f}", ha="center", va="bottom", fontsize=9)
 
     plt.tight_layout()
-    plt.savefig("results/figures/fig18_complexity.pdf")
-    plt.savefig("results/figures/fig18_complexity.png")
+    plt.savefig(f"{FIG_DIR}/fig18_complexity.pdf")
+    plt.savefig(f"{FIG_DIR}/fig18_complexity.png")
     plt.close()
     print("  Saved fig18_complexity")
 
@@ -431,8 +460,8 @@ def fig_ablation(scale):
 
     fig.suptitle("Ablation Study: Algorithm Components at n=8 and n=16", fontsize=12)
     plt.tight_layout()
-    plt.savefig("results/figures/fig19_ablation.pdf")
-    plt.savefig("results/figures/fig19_ablation.png")
+    plt.savefig(f"{FIG_DIR}/fig19_ablation.pdf")
+    plt.savefig(f"{FIG_DIR}/fig19_ablation.png")
     plt.close()
     print("  Saved fig19_ablation")
 
@@ -461,8 +490,8 @@ def fig_combined_learning():
     for ax in axes:
         ax.legend(); ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("results/figures/fig12_13_training_curves.pdf")
-    plt.savefig("results/figures/fig12_13_training_curves.png")
+    plt.savefig(f"{FIG_DIR}/fig12_13_training_curves.pdf")
+    plt.savefig(f"{FIG_DIR}/fig12_13_training_curves.png")
     plt.close()
     print("  Saved fig12_13_training_curves")
 
@@ -505,18 +534,19 @@ if __name__ == "__main__":
 
     fig_combined_learning()  # Fig 12+13 (needs saved JSON)
 
-    # Fig 14-16: CDFs at n=8
+    # Fig 14-16: CDFs at the representative distribution density
+    cdf_n = DIST_DENSITIES[0]
     sinr_db_steps = {}
     for alg in dist:
-        if 8 in dist.get(alg, {}):
-            sinr_db_steps[alg] = {8: {
-                **dist[alg][8],
-                "sinr_db": [10*math.log10(max(v,1e-9)) for v in dist[alg][8]["sinr"]],
+        if cdf_n in dist.get(alg, {}):
+            sinr_db_steps[alg] = {cdf_n: {
+                **dist[alg][cdf_n],
+                "sinr_db": [10*math.log10(max(v,1e-9)) for v in dist[alg][cdf_n]["sinr"]],
             }}
 
-    fig_cdf(sinr_db_steps,  "sinr_db",     "SINR (dB)",              "SINR CDF (n=8)",        "fig14_sinr_cdf")
-    fig_cdf(dist,           "latency_viol","Latency Violation Rate",  "Latency CDF (n=8)",     "fig15_latency_cdf")
-    fig_cdf(dist,           "throughput",  "Throughput (bits/s/Hz)",  "Throughput CDF (n=8)",  "fig16_throughput_cdf")
+    fig_cdf(sinr_db_steps, "sinr_db",     "SINR (dB)",               f"SINR CDF (n={cdf_n})",       "fig14_sinr_cdf",       density=cdf_n)
+    fig_cdf(dist,          "latency_viol","Latency Violation Rate",  f"Latency CDF (n={cdf_n})",    "fig15_latency_cdf",    density=cdf_n)
+    fig_cdf(dist,          "throughput",  "Throughput (bits/s/Hz)",  f"Throughput CDF (n={cdf_n})", "fig16_throughput_cdf", density=cdf_n)
 
     fig_boxplot(dist)        # Fig 17
     fig_complexity()         # Fig 18
@@ -524,7 +554,7 @@ if __name__ == "__main__":
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"All figures saved to results/figures/")
+    print(f"All figures saved to {FIG_DIR}/")
     print(f"Total time: {elapsed/60:.1f} minutes")
     print(f"\nPDF files ready for LaTeX inclusion.")
     print(f"Fig 12+13 (training curves): run train_sota.py once more to generate history JSON.")

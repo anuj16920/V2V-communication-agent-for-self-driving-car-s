@@ -28,6 +28,7 @@ from collections import defaultdict
 from env_manhattan import V2VManhattanEnv
 from networks    import MAPPOActor
 from agent_qmix  import QMIXAgent
+from agent_graph_mappo import PGATMAPPOAgent
 from baselines   import random_policy, greedy_csi_policy, round_robin_policy
 
 os.makedirs("results", exist_ok=True)
@@ -38,8 +39,9 @@ EPISODE_LEN  = 50
 N_SUBCH      = 4
 N_ACTIONS    = 16       # 4ch × 4pwr
 
-# Densities: trained points + scalability sweep 20→120
-DENSITIES = [8, 16, 20, 24, 32, 40, 60, 80, 100, 120]
+# Target density sweep (PGAT trained on these; MAPPO evaluated zero-shot from n=8;
+# QMIX auto-skips — its mixer is N-specific and no checkpoints exist at these N).
+DENSITIES = [20, 40, 60, 80, 100, 120]
 
 # ── Metrics ──────────────────────────────────────────────────────────────────
 
@@ -76,25 +78,32 @@ def compute_metrics(acc: dict, n_v2v: int) -> dict:
 
 
 def run_episodes(env, policy_fn, n_eps: int) -> dict:
-    """Run n_eps episodes, return aggregated info."""
+    """
+    Run n_eps episodes, return aggregated info.
+    policy_fn signature: (state, step, info) -> actions.
+    `info` carries the graph data PGAT needs; other policies ignore it.
+    """
     acc = defaultdict(list)
     for _ in range(n_eps):
-        state, _ = env.reset()
+        state, info = env.reset()           # reset info already holds graph fields
         done = False
         step = 0
         while not done:
-            actions = policy_fn(state, step)
+            actions = policy_fn(state, step, info)
             state, _, done, _, info = env.step(actions)
             step += 1
         for k, v in info.items():
-            acc[k].append(v)
+            if isinstance(v, (int, float)):  # skip graph arrays (positions, etc.)
+                acc[k].append(v)
     return acc
 
 
-# ── Policy wrappers ───────────────────────────────────────────────────────────
+# ── Policy wrappers (all accept (state, step, info); non-PGAT ignore info) ─────
 
 def wrap_baseline(fn, env):
-    return lambda s, t: fn(env, s) if fn is not round_robin_policy else round_robin_policy(env, s, t)
+    if fn is round_robin_policy:
+        return lambda s, t, info: round_robin_policy(env, s, t)
+    return lambda s, t, info: fn(env, s)
 
 
 def load_mappo_actor(n_v2v_trained: int = 8):
@@ -115,12 +124,34 @@ def load_mappo_actor(n_v2v_trained: int = 8):
 def mappo_policy(actor: MAPPOActor):
     """Greedy deterministic policy using MAPPO actor (mode of Categorical)."""
     @torch.no_grad()
-    def _act(state, _step):
+    def _act(state, _step, _info):
         s = torch.FloatTensor(state).to(DEVICE)
         dist = actor.get_dist(s)
         # Use mode (argmax of logits) for deterministic eval
         return dist.logits.argmax(dim=-1).cpu().numpy()
     return _act
+
+
+def load_pgat_mixed():
+    """Load the mixed-density PGAT model (N-agnostic, works at any density)."""
+    for path in ("models_pgat/pgat_mixed_best.pth",
+                 "models_pgat/pgat_mixed_final.pth"):
+        if os.path.exists(path):
+            ckpt  = torch.load(path, map_location=DEVICE)
+            agent = PGATMAPPOAgent(state_dim=32, n_actions=N_ACTIONS, n_agents=20,
+                                   d_model=128, n_heads=4, n_layers=3, device=DEVICE)
+            agent.actor.load_state_dict(ckpt["actor"])
+            agent.actor.eval()
+            agent.set_eval_temperature(0.3)   # argmax collapses all agents to same channel
+            print(f"  [PGAT] loaded {path}  (mixed-density, eval any n, T=0.3)")
+            return agent
+    print("  [PGAT] no mixed checkpoint found in models_pgat/")
+    return None
+
+
+def pgat_policy(agent):
+    """PGAT needs the env info dict (graph data) at each step."""
+    return lambda s, _t, info: agent.act_eval(s, info)
 
 
 def load_qmix_agent(n_v2v: int) -> QMIXAgent | None:
@@ -141,7 +172,7 @@ def load_qmix_agent(n_v2v: int) -> QMIXAgent | None:
 
 
 def qmix_policy(agent: QMIXAgent):
-    return lambda s, _t: agent.act(s, explore=False)
+    return lambda s, _t, _info: agent.act(s, explore=False)
 
 
 # ── Main evaluation loop ──────────────────────────────────────────────────────
@@ -151,8 +182,10 @@ def evaluate_all():
     print(f"Episodes per (algorithm × density): {EVAL_EPS}")
     print(f"Densities: {DENSITIES}\n")
 
-    # Load models once
+    # Load models once. MAPPO actor is N-agnostic -> load the n=8 checkpoint and
+    # evaluate it zero-shot at every density. PGAT mixed model handles any N too.
     mappo_actor = load_mappo_actor(n_v2v_trained=8)
+    pgat_agent  = load_pgat_mixed()
 
     all_rows = []   # for CSV
     summary  = {}   # density → {algorithm → metrics}
@@ -177,10 +210,14 @@ def evaluate_all():
         if mappo_actor is not None:
             algorithms["MAPPO"] = mappo_policy(mappo_actor)
 
-        # QMIX only if exact checkpoint exists for this density
+        # QMIX only if exact checkpoint exists for this density (N-specific mixer)
         qmix_agent = load_qmix_agent(n)
         if qmix_agent is not None:
             algorithms["QMIX"] = qmix_policy(qmix_agent)
+
+        # PGAT mixed-density model (N-agnostic) — our method
+        if pgat_agent is not None:
+            algorithms["PGAT"] = pgat_policy(pgat_agent)
 
         for alg_name, policy_fn in algorithms.items():
             print(f"  {alg_name:<14} ...", end="", flush=True)
@@ -227,9 +264,9 @@ def save_summary_txt(summary: dict, path: str):
     ]
 
     # ── Table 1: PDR across densities ──────────────────────────────────────
+    _ORDER = ["Random", "Greedy_CSI", "Round_Robin", "MAPPO", "QMIX", "PGAT"]
     algs_present = sorted({a for n in summary for a in summary[n]},
-                          key=lambda x: ["Random","Greedy_CSI","Round_Robin","MAPPO","QMIX"].index(x)
-                          if x in ["Random","Greedy_CSI","Round_Robin","MAPPO","QMIX"] else 99)
+                          key=lambda x: _ORDER.index(x) if x in _ORDER else 99)
 
     lines.append("  TABLE 1: Packet Delivery Ratio (PDR) by Density")
     lines.append("  " + "─" * 68)
@@ -283,8 +320,9 @@ def save_summary_txt(summary: dict, path: str):
         lines.append(row)
     lines.append("")
 
-    # ── Table 5: Full metric table at n=8 (trained density) ────────────────
-    lines.append("  TABLE 5: Full Metrics at n=8 (Trained Density)")
+    # ── Table 5: Full metric table at the lowest swept density ─────────────
+    _n0 = DENSITIES[0]
+    lines.append(f"  TABLE 5: Full Metrics at n={_n0} (Lowest Swept Density)")
     lines.append("  " + "─" * 68)
     col_w = 10
     hdr   = f"  {'Metric':<18}" + "".join(f"{a:>{col_w}}" for a in algs_present)
@@ -293,7 +331,7 @@ def save_summary_txt(summary: dict, path: str):
     for metric in METRIC_COLS:
         row = f"  {metric:<18}"
         for alg in algs_present:
-            val = summary[8].get(alg, {}).get(metric, None)
+            val = summary[_n0].get(alg, {}).get(metric, None)
             row += f"{val:{col_w}.4f}" if val is not None else " " * col_w + "—"
         lines.append(row)
     lines.append("")

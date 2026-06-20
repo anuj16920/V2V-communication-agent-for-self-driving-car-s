@@ -152,6 +152,35 @@ class V2VManhattanEnv(gym.Env):
         self._rew_m2   = 0.0
         self._rew_n    = 0
 
+    # ── Graph info for PGAT-MAPPO (shared by reset and step) ──────────────────
+    def _graph_info(self, los_matrix=None, sinrs=None, channels=None) -> dict:
+        """
+        Build the graph-structured fields the PGAT-MAPPO agent consumes.
+
+        At reset(), no action has been taken yet, so los_matrix/sinrs/channels
+        are unknown: LoS is computed from current positions, while sinrs and
+        channels fall back to the previous-step history (zeros after reset).
+        During step(), the freshly-computed values are passed in directly.
+        """
+        if los_matrix is None:
+            los_matrix = np.zeros((self.n_v2v, self.n_v2v), dtype=bool)
+            for i in range(self.n_v2v):
+                for j in range(i + 1, self.n_v2v):
+                    los_matrix[i, j] = los_matrix[j, i] = self._is_los(i, j)
+        if sinrs is None:
+            sinrs = self.prev_sinr
+        if channels is None:
+            channels = self.prev_channels
+        velocities = (DIR_VEC[self.directions] *
+                      (self.speeds / 3.6)[:, None]).astype(np.float32)
+        return {
+            "positions":  self.positions.copy(),                          # (N,2)
+            "velocities": velocities.copy(),                              # (N,2) m/s
+            "los_matrix": np.asarray(los_matrix, dtype=bool).copy(),      # (N,N)
+            "sinrs":      np.asarray(sinrs,    dtype=np.float32).copy(),  # (N,)
+            "channels":   np.asarray(channels, dtype=np.int64).copy(),   # (N,)
+        }
+
     # ── Reset ────────────────────────────────────────────────────────────────
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -182,7 +211,7 @@ class V2VManhattanEnv(gym.Env):
         self.queue    = np.random.randint(3, 10, self.n_v2v).astype(np.float32)
         self.deadline = np.random.randint(4, 10, self.n_v2v).astype(np.float32)
 
-        return self._get_obs(), {}
+        return self._get_obs(), self._graph_info()
 
     # ── Street/grid helpers ──────────────────────────────────────────────────
     def _random_street_position(self):
@@ -603,6 +632,9 @@ class V2VManhattanEnv(gym.Env):
             "avg_los_ratio":         los_ratio_avg,
             "avg_int_bonus":         float(np.mean(int_bonus)),
         }
+        # Graph data for PGAT-MAPPO (uses the freshly-computed current values)
+        info.update(self._graph_info(los_matrix=los_matrix,
+                                      sinrs=sinrs, channels=channels))
 
         obs        = self._get_obs()
         terminated = self.current_step >= self.episode_len
